@@ -39,6 +39,16 @@ SELL_SLIPPAGE_BPS = 120
 CASH_FRACTION = 0.995    # keep a sliver back so the fill always clears
 MIN_NOTIONAL_MULT = 2    # only enter if size >= twice the venue minimum
 
+# --- round-trip cost model --------------------------------------------------
+# What one complete trade pays, in bps of notional:
+#   fees      4 bps on each fill (entry + exit)           = 8 bps
+#   slippage  2 bps per side, the tolerance we hand in    = 4 bps
+#   impact    ~10-15 bps at a ~1,000 USDC order against
+#             the dev window's 700k-1M USDC depths        = ~14 bps
+#   total     ~26 bps of notional paid to go in and out.
+# The 60 bps entry threshold sits well above that ~26 bps so a trade must
+# clear its own cost by more than a 2x margin before it is taken.
+
 BPS = 10_000.0
 
 
