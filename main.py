@@ -1,143 +1,181 @@
-"""cbBTC minute-bar trading bot: regime-gated momentum with a volatility trail.
+"""cbBTC minute-bar strategy bot for agent-fun/bars-replay/v1.
 
-The bot is long-only on one symbol and holds cash by default. It buys only when a slow
-trend gate says the market is in an up-regime and the last hour's return is large enough
-to clear a full round trip's fees, slippage and price impact; it then rides the move with
-a trailing stop measured in units of realised per-minute volatility and steps aside as
-soon as the trend gate breaks. Every exit condition is a rule on data already received,
-so two runs over the same batch stream take byte-identical decisions.
+Long-only trend follower with a volatility gate:
+  * three incremental EMAs (20, 360, 240) over the closes seen so far
+  * 60-bar return in bps and 60-bar population stdev in bps
+  * entry when trend and momentum agree and the tape is quiet
+  * exit on a stdev-scaled trailing stop, a hard stop, or a trend break
+
+The harness runs this file as ``python3 -P -s /bot/main.py``, so it has to
+trust nothing about sys.path and add its own vendor/ directory first.
 """
 
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor"))
+_VENDOR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "vendor")
+if _VENDOR not in sys.path:
+    sys.path.insert(0, _VENDOR)
 
-import makefun_bars
+import makefun_bars  # noqa: E402  (after the sys.path fix, on purpose)
 
 SYMBOL = "CBBTC"
 
-# Slow trend gate: EMA(20) above EMA(360) means the last six hours trend up.
-FAST_EMA = 20
-SLOW_EMA = 360
-# The trend gate's own exit line: leave once the fast EMA falls under the 4-hour EMA.
-EXIT_EMA = 240
-# Momentum trigger: the last hour's return, in basis points, that is worth a round trip.
-MOM_BARS = 60
-MOM_BPS = 60
-# Trailing stop: 2.5 units of the 60-bar standard deviation, so it breathes with the tape.
-TRAIL_SIGMA = 2.5
-VOL_WINDOW = 60
-# Refuse new risk when a single minute's volatility explodes past this many basis points.
-VOL_EXPLODE_BPS = 80.0
-# Hard stop on the open position, from its entry price, in basis points.
-HARD_STOP_BPS = 130
-# Fraction of cash committed to a buy, leaving room for the fee and any rounding.
-CASH_FRACTION = 0.995
-# Orders are allowed to fill this far from the close they were decided on; a wider gap is
-# not chased. The modelled slippage plus this size's own impact is well inside it.
-MAX_SLIPPAGE_BPS = 120
+# --- strategy parameters ----------------------------------------------------
+EMA_FAST_N = 20
+EMA_SLOW_N = 360
+EMA_TREND_N = 240
+
+RET_WINDOW = 60          # bars used for the momentum return
+VOL_WINDOW = 60          # bars used for the volatility estimate
+MIN_HISTORY = 420        # no entries before this many closes
+
+ENTRY_RETURN_BPS = 60.0  # 60-bar return must exceed this
+ENTRY_VOL_BPS = 80.0     # and volatility must stay at or under this
+TRAIL_SIGMA = 2.5        # trailing stop distance, in sigmas
+HARD_STOP_BPS = 130.0    # hard stop below the entry close
+BUY_SLIPPAGE_BPS = 120
+SELL_SLIPPAGE_BPS = 120
+CASH_FRACTION = 0.995    # keep a sliver back so the fill always clears
+MIN_NOTIONAL_MULT = 2    # only enter if size >= twice the venue minimum
+
+BPS = 10_000.0
 
 
 class Strategy:
-    """Everything the bot remembers, updated once per minute bar."""
+    """Stateful per-run strategy: price history, EMAs, and the open trade."""
 
     def __init__(self):
         self.closes = []
-        self.fast = None
-        self.slow = None
-        self.exit_line = None
-        self.peak = 0
-        self.entry = 0
+        self.ema_fast = None
+        self.ema_slow = None
+        self.ema_trend = None
+        self.entry_price = None
+        self.peak_price = None
 
-    def _ema(self, value):
-        """Advance the two trend EMAs and the exit line by one close."""
-        for name, period in (("fast", FAST_EMA), ("slow", SLOW_EMA), ("exit_line", EXIT_EMA)):
-            prev = getattr(self, name)
-            if prev is None:
-                setattr(self, name, value)
-            else:
-                weight = 2.0 / (period + 1.0)
-                setattr(self, name, value * weight + prev * (1.0 - weight))
+    # -- indicator bookkeeping ----------------------------------------------
+
+    def _seed_or_update(self, current, close, n):
+        if current is None:
+            return float(close)
+        alpha = 2.0 / (n + 1.0)
+        return current + alpha * (float(close) - current)
+
+    def _push(self, close):
+        self.closes.append(close)
+        self.ema_fast = self._seed_or_update(self.ema_fast, close, EMA_FAST_N)
+        self.ema_slow = self._seed_or_update(self.ema_slow, close, EMA_SLOW_N)
+        self.ema_trend = self._seed_or_update(self.ema_trend, close, EMA_TREND_N)
+
+    # -- measurements --------------------------------------------------------
+
+    def _return_bps(self):
+        window = self.closes[-(RET_WINDOW + 1):]
+        base = window[0]
+        if base <= 0:
+            return 0.0
+        return (float(self.closes[-1]) - float(base)) / float(base) * BPS
 
     def _sigma_bps(self):
-        """Per-minute volatility in basis points over the trailing window."""
-        window = self.closes[-VOL_WINDOW:]
-        if len(window) < VOL_WINDOW:
-            return None
-        mean = sum(window) / float(VOL_WINDOW)
-        var = sum((x - mean) * (x - mean) for x in window) / float(VOL_WINDOW)
+        sample = self.closes[-VOL_WINDOW:]
+        count = len(sample)
+        if count == 0:
+            return 0.0
+        mean = sum(float(x) for x in sample) / float(count)
         if mean <= 0:
-            return None
-        return (var ** 0.5) / mean * 10000.0
+            return 0.0
+        variance = sum((float(x) - mean) ** 2 for x in sample) / float(count)
+        return variance ** 0.5 / mean * BPS
 
-    def _momentum_bps(self):
-        """The trailing hour's return in basis points, or None before there is an hour."""
-        if len(self.closes) <= MOM_BARS:
-            return None
-        then = self.closes[-MOM_BARS - 1]
-        if then <= 0:
-            return None
-        return (self.closes[-1] - then) / float(then) * 10000.0
+    # -- the callbacks -------------------------------------------------------
 
-    def on_bar(self, state, bar):
-        """Fold one new close in. Returns the order list for the next bar, or []."""
-        self.closes.append(int(bar["c"]))
-        self._ema(int(bar["c"]))
-        price = int(bar["c"])
-        sigma = self._sigma_bps()
-        held = state.positions.get(SYMBOL)
-
-        if held is not None and held.qty > 0:
-            if price > self.peak:
-                self.peak = price
-            stopped = sigma is not None and price < self.peak * (1.0 - TRAIL_SIGMA * sigma / 10000.0)
-            lost_too_much = price < self.entry * (1.0 - HARD_STOP_BPS / 10000.0)
-            trend_gone = self.fast < self.exit_line
-            if stopped or lost_too_much or trend_gone:
-                return [{
-                    "side": "sell",
-                    "symbol": SYMBOL,
-                    "qty": held.qty,
-                    "max_slippage_bps": MAX_SLIPPAGE_BPS,
-                }]
+    def on_batch(self, state, batch):
+        bar = None
+        for candidate in batch.get("bars", ()):
+            if candidate.get("symbol") == SYMBOL:
+                bar = candidate
+                break
+        if bar is None:
             return []
 
-        momentum = self._momentum_bps()
-        if momentum is None or sigma is None:
-            return []
-        if sigma > VOL_EXPLODE_BPS:
-            return []
-        if self.fast <= self.slow or momentum <= MOM_BPS:
+        close = int(bar["c"])
+        self._push(close)
+
+        if state.warming_up:
             return []
 
-        room = state.weight_room(SYMBOL)
-        budget = int(min(room, state.cash * CASH_FRACTION))
-        minimum = int(state.hello["fees"]["min_notional_quote_units"])
-        if budget < minimum * 2:
+        if len(self.closes) < MIN_HISTORY:
             return []
-        self.peak = price
-        self.entry = price
+
+        sigma_bps = self._sigma_bps()
+        holding = state.positions.get(SYMBOL)
+
+        if holding is not None and int(holding.qty) > 0:
+            return self._manage_exit(state, close, sigma_bps, holding)
+
+        # Flat: the trade is over, forget the old reference prices.
+        self.entry_price = None
+        self.peak_price = None
+        return self._consider_entry(state, close, sigma_bps)
+
+    def _consider_entry(self, state, close, sigma_bps):
+        if self.ema_fast <= self.ema_slow:
+            return []
+        if self._return_bps() <= ENTRY_RETURN_BPS:
+            return []
+        if sigma_bps > ENTRY_VOL_BPS:
+            return []
+
+        min_notional = int(state.hello["fees"]["min_notional_quote_units"])
+        budget = min(int(state.weight_room(SYMBOL)), int(state.cash * CASH_FRACTION))
+        if budget <= 0:
+            return []
+        if budget < MIN_NOTIONAL_MULT * min_notional:
+            return []
+
+        self.entry_price = close
+        self.peak_price = close
         return [{
             "side": "buy",
             "symbol": SYMBOL,
             "notional_quote_units": budget,
-            "max_slippage_bps": MAX_SLIPPAGE_BPS,
+            "max_slippage_bps": BUY_SLIPPAGE_BPS,
+        }]
+
+    def _manage_exit(self, state, close, sigma_bps, holding):
+        if self.entry_price is None:
+            self.entry_price = close
+        if self.peak_price is None or close > self.peak_price:
+            self.peak_price = close
+
+        trail_level = self.peak_price * (1.0 - TRAIL_SIGMA * sigma_bps / BPS)
+        stop_level = self.entry_price * (1.0 - HARD_STOP_BPS / BPS)
+
+        hit_trail = float(close) < trail_level
+        hit_stop = float(close) < stop_level
+        hit_trend = self.ema_fast < self.ema_trend
+
+        if not (hit_trail or hit_stop or hit_trend):
+            return []
+
+        self.entry_price = None
+        self.peak_price = None
+        return [{
+            "side": "sell",
+            "symbol": SYMBOL,
+            "qty": int(holding.qty),
+            "max_slippage_bps": SELL_SLIPPAGE_BPS,
         }]
 
 
-def on_batch(state, batch):
-    """Answer one batch: one order list, decided on the bar that just closed."""
-    if state.warming_up:
-        return []
-    for bar in batch["bars"]:
-        if bar["symbol"] == SYMBOL:
-            return STRATEGY.on_bar(state, bar)
-    return []
+def main():
+    strategy = Strategy()
 
+    def on_batch(state, batch):
+        return strategy.on_batch(state, batch)
 
-STRATEGY = Strategy()
+    makefun_bars.run(on_batch)
 
 
 if __name__ == "__main__":
-    makefun_bars.run(on_batch)
+    main()
